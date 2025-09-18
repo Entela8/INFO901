@@ -2,10 +2,8 @@
 from __future__ import annotations
 import threading, time
 from typing import TYPE_CHECKING
+from Com import HEARTBEAT_TIMEOUT_SEC
 from Message import Message
-
-HEARTBEAT_SEC = 1.0
-HEARTBEAT_TIMEOUT_SEC = 3.5
 
 if TYPE_CHECKING:
     from Com import Com

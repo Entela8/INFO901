@@ -1,9 +1,13 @@
 from Com import Com, Bus
+from geeteventbus.subscriber import subscriber
+from geeteventbus.eventbus import eventbus
+from geeteventbus.event import event
 
 class Process:
     def __init__(self, bus: Bus):
         self.com = Com(bus, on_receive=self._on_receive)
 
+    @subscribe(threadMode = Mode.PARALLEL, onEvent=token)
     def _on_receive(self, msg):
         kind = msg.kind.name
         sender = msg.sender
@@ -14,14 +18,23 @@ class Process:
 
         # ASYNC
         self.com.broadcast({"BONJOUR": f"from {self.com.id}"})
-        self.com.sendTo({"dm": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
-                        dest=(self.com.id + 1) % len(self.com.bus._directory))
+        self.com.sendTo(
+            {"dm": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
+            dest=(self.com.id + 1) % len(self.com.bus._directory)
+        )
 
         # SYNC
-        self.com.broadcastSync({"sync_all": f"from {self.com.id}"}, from_id=self.com.id)
-        self.com.sendToSync({"sync_one": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
-                            dest=(self.com.id + 1) % len(self.com.bus._directory))
-        _ = self.com.recvFromSync(from_id=(self.com.id - 1) % len(self.com.bus._directory), timeout=2)
+        self.com.broadcastSync(
+            {"sync_all": f"from {self.com.id}"}, 
+            from_id=self.com.id
+        )
+        self.com.sendToSync(
+            {"sync_one": f"to {(self.com.id + 1) % len(self.com.bus._directory)} "},
+            dest=(self.com.id + 1) % len(self.com.bus._directory)
+        )
+        _ = self.com.recvFromSync(
+            from_id=(self.com.id - 1) % len(self.com.bus._directory), timeout=2
+        )
 
         # BARRIÈRE
         print(f"[P{self.com.id}] waiting barrier")

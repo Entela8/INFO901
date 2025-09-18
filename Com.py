@@ -69,7 +69,7 @@ class Com:
             self.clock += delta
             return self.clock
 
-    def _update_clock_on_recv(self, other: int):
+    def update_clock_on_recv(self, other: int):
         with self.clock_lock:
             self.clock = max(self.clock, other) + 1
 
@@ -143,20 +143,21 @@ class Com:
     def requestSC(self):
         self._token_evt.wait()
 
+    #in release juste liberer la SC, et pas renvoiyer le token, function token propre pour mettre à jour le token
     def releaseSC(self):
         with self._token_next_lock:
-            next_id = (self.id + 1) % self._world_size()
+            next_id = (self.id + 1) % self._world_size() #const
         self._token_evt.clear()
         self.bus.sendto(next_id, Token(holder=next_id))
 
-    # === Arrêt propre ===
+    # === Arrêt ===
     def close(self):
         self._stop.set()
         self.bus.leave(self)
 
     def _deliver(self, msg: Message):
         if msg.kind == MsgKind.USER:
-            self._update_clock_on_recv(msg.lamport)
+            self.update_clock_on_recv(msg.lamport)
             ack_seq = getattr(msg, "ack_seq", None)
             if ack_seq is not None and msg.sender is not None:
                 self.bus.sendto(msg.sender, AckMessage(seq=ack_seq, sender=self.id))
@@ -201,11 +202,11 @@ class Com:
         return len(self.bus._directory)
 
     # threads
+    # heartbeats
     def _hb_loop(self):
         while not self._stop.is_set():
             self.bus.heartbeat(self.node_uid)
             time.sleep(HEARTBEAT_SEC)
-
     def _timeout_loop(self):
         while not self._stop.is_set():
             self.bus.check_timeouts()
