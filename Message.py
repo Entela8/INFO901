@@ -13,5 +13,12 @@ class MsgKind(Enum):
 class Message:
     kind: MsgKind
     payload: object | None
-    lamport: int 
+    lamport: int
     sender: int | None
+
+@dataclass
+class AckMessage(Message):
+    seq: int
+    def __init__(self, seq: int, sender: int):
+        super().__init__(MsgKind.ACK, None, 0, sender)
+        self.seq = seq

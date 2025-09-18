@@ -1,101 +1,27 @@
 import threading, time, uuid
-from collections import defaultdict, deque
+from collections import deque
 from typing import Callable
 
-from Message import Message, MsgKind
+import Bus
+from typing import TYPE_CHECKING, Callable
+from Message import AckMessage, Message, MsgKind
 from BroadcastMessage import BroadcastMessage
 from MessageTo import MessageTo
 from Token import Token
-from Synchronize import BarrierMessage
 
 HEARTBEAT_SEC = 1.0
 HEARTBEAT_TIMEOUT_SEC = 3.5
 
-class Bus:
-    """Bus mémoire partagé: pas de variable de classe dans Com.
-       On passe une instance de Bus au constructeur de Com.
-    """
-    def __init__(self):
-        self._lock = threading.RLock()
-        self._subscribers: dict[str, "Com"] = {}
-        self._directory: list[str] = [] 
-        self._last_hb: dict[str, float] = {}
-        self._barrier_waiting: set[str] = set()
-
-    # === Annuaire et diffusion ===
-    def join(self, com: "Com") -> int:
-        with self._lock:
-            node_uid = com.node_uid
-            self._subscribers[node_uid] = com
-            self._last_hb[node_uid] = time.time()
-            # ordre par uid => numérotation déterministe sans variable de classe
-            if node_uid not in self._directory:
-                self._directory.append(node_uid)
-                self._directory.sort()
-            self._renumber()
-            return self._directory.index(node_uid)
-
-    def leave(self, com: "Com"):
-        with self._lock:
-            self._subscribers.pop(com.node_uid, None)
-            self._last_hb.pop(com.node_uid, None)
-            if com.node_uid in self._directory:
-                self._directory.remove(com.node_uid)
-            self._renumber()
-
-    def _renumber(self):
-        # envoie un message RENUMBER à tous
-        mapping = {uid: idx for idx, uid in enumerate(self._directory)}
-        for c in list(self._subscribers.values()):
-            c._onRenumber(mapping)
-
-    def broadcast(self, msg: Message, exclude_uid: str | None = None):
-        with self._lock:
-            for uid, c in self._subscribers.items():
-                if uid == exclude_uid:
-                    continue
-                c._deliver(msg)
-
-    def sendto(self, dest_id: int, msg: Message):
-        with self._lock:
-            if 0 <= dest_id < len(self._directory):
-                uid = self._directory[dest_id]
-                c = self._subscribers.get(uid)
-                if c:
-                    c._deliver(msg)
-
-    def heartbeat(self, sender_uid: str):
-        with self._lock:
-            self._last_hb[sender_uid] = time.time()
-
-    def check_timeouts(self):
-        with self._lock:
-            now = time.time()
-            dead = [uid for uid, t0 in self._last_hb.items()
-                    if now - t0 > HEARTBEAT_TIMEOUT_SEC]
-            if dead:
-                for uid in dead:
-                    self._subscribers.pop(uid, None)
-                    self._last_hb.pop(uid, None)
-                    if uid in self._directory:
-                        self._directory.remove(uid)
-                self._renumber()
-
-    # === Barrière ===
-    def barrier_arrive(self, uid: str):
-        with self._lock:
-            self._barrier_waiting.add(uid)
-            if self._barrier_waiting == set(self._subscribers.keys()):
-                # tous présents: vider et notifier
-                self._barrier_waiting.clear()
-                for c in list(self._subscribers.values()):
-                    c._onBarrierRelease()
-
+if TYPE_CHECKING:
+    from Bus import Bus
 
 class Com:
-    def __init__(self, bus: Bus, on_receive: Callable[[Message], None] | None = None):
+    def __init__(self, bus: "Bus", on_receive: Callable[[Message], None] | None = None):
         self.bus = bus
+        self._ack_lock = threading.RLock()
+        self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
         self.node_uid = f"{uuid.uuid4()}"
+        self._ack_seq = 0
         self.id_lock = threading.RLock()
         self.id: int = -1
 
@@ -177,31 +103,32 @@ class Com:
             ts = self.inc_clock()
             seq = self._new_seq()
             msg = BroadcastMessage(payload=payload, lamport=ts, sender=self.id)
-            # envoyer et attendre n-1 ACKs (un seul event global suffit si on compte)
-            waiter = self._pending_acks[seq] = threading.Event()
-            self._acks_needed = self._world_size() - 1
-            self._ack_seq_current = seq
+            msg.ack_seq = seq
+            remaining = self._world_size() - 1
+            evt = threading.Event()
+            with self._ack_lock:
+                self._pending_acks[seq] = (evt, remaining)
             self.bus.broadcast(msg, exclude_uid=self.node_uid)
-            waiter.wait()
+            evt.wait()
         else:
-            # côté receveur: attend réception (normal) => ACK auto dans _deliver
             pass
 
     def sendToSync(self, payload: object, dest: int):
         ts = self.inc_clock()
         seq = self._new_seq()
         msg = MessageTo(payload=payload, lamport=ts, sender=self.id, dest=dest)
-        waiter = self._pending_acks[seq] = threading.Event()
-        msg._ack_seq = seq
+        msg.ack_seq = seq
+        evt = threading.Event()
+        with self._ack_lock:
+            self._pending_acks[seq] = (evt, 1)
         self.bus.sendto(dest, msg)
-        waiter.wait()
+        evt.wait()
 
     def recvFromSync(self, from_id: int, timeout: float | None = None) -> Message | None:
         t0 = time.time()
         while True:
             m = self.receive(block=True, timeout=timeout)
             if m and getattr(m, "sender", None) == from_id and m.kind == MsgKind.USER:
-                # l’ACK part dans _deliver()
                 return m
             if timeout is not None and (time.time() - t0) > timeout:
                 return None
@@ -230,55 +157,39 @@ class Com:
     def _deliver(self, msg: Message):
         if msg.kind == MsgKind.USER:
             self._update_clock_on_recv(msg.lamport)
-            ack = Message(kind=MsgKind.ACK, payload=None, lamport=0, sender=self.id)
-            if hasattr(msg, "dest"):
-                self.bus.sendto(msg.sender, ack)
-            else:
-                self.bus.sendto(msg.sender, ack)
+            ack_seq = getattr(msg, "ack_seq", None)
+            if ack_seq is not None and msg.sender is not None:
+                self.bus.sendto(msg.sender, AckMessage(seq=ack_seq, sender=self.id))
+
+            # déposer en BAL
+            with self.mailbox_lock:
+                self.mailbox.append(msg)
+                self.mailbox_has_msg.set()
+            if self.on_receive:
+                try: self.on_receive(msg)
+                except Exception: pass
+            return
 
         elif msg.kind == MsgKind.ACK:
-            with self._ack_lock:
-                if hasattr(self, "_ack_seq_current"):
-                    self._acks_needed -= 1
-                    if self._acks_needed <= 0:
-                        evt = self._pending_acks.pop(self._ack_seq_current, None)
-                        if evt:
+            seq = getattr(msg, "seq", None)
+            if seq is not None:
+                with self._ack_lock:
+                    evt, remaining = self._pending_acks.get(seq, (None, 0))
+                    if evt:
+                        remaining -= 1
+                        if remaining <= 0:
+                            self._pending_acks.pop(seq, None)
                             evt.set()
+                        else:
+                            self._pending_acks[seq] = (evt, remaining)
             return
-
-        elif msg.kind == MsgKind.BARRIER:
-            return
-
-        elif msg.kind == MsgKind.HEARTBEAT:
-            return
-
-        elif msg.kind == MsgKind.RENUMBER:
-            mapping = msg.payload
-            with self.id_lock:
-                self.id = mapping[self.node_uid]
-            return
-
-        elif msg.kind == MsgKind.TOKEN:
-            if isinstance(msg, Token) and msg.holder == self.id:
-                self._token_evt.set()
-            return
-
-        # USER messages vont en BAL
-        with self.mailbox_lock:
-            self.mailbox.append(msg)
-            self.mailbox_has_msg.set()
-
-        if self.on_receive:
-            try:
-                self.on_receive(msg)
-            except Exception:
-                pass
-
+        
     def _new_seq(self) -> int:
         with self._ack_lock:
             self._ack_seq += 1
             return self._ack_seq
 
+    #mets à jour l'identifiant logique
     def _onRenumber(self, mapping: dict[str, int]):
         m = Message(kind=MsgKind.RENUMBER, payload=mapping, lamport=0, sender=None)
         self._deliver(m)

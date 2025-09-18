@@ -1,6 +1,6 @@
-from Com import Bus
 from Process import Process
-import threading, time
+import threading
+from Bus import Bus
 
 def main():
     bus = Bus()
@@ -8,16 +8,17 @@ def main():
 
     threads = []
     for p in procs:
-        t = threading.Thread(target=p.run_example, daemon=True)
+        t = threading.Thread(target=p.run_example)
         t.start()
         threads.append(t)
 
-    time.sleep(5)
+    for t in threads:
+        t.join()
+
     for p in procs:
         p.close()
 
-    for t in threads:
-        t.join(timeout=1)
-
 if __name__ == "__main__":
+    print("[MAIN] starting demo")
     main()
+    print("[MAIN] done")

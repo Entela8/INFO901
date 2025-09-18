@@ -1,0 +1,160 @@
+# 🧠 Objectif du TP
+
+Créer un **middleware (intergiciel)** appelé `Com` qui :
+
+* s’intercale entre les processus utilisateurs
+* gère toute la **communication inter-processus** (async, sync)
+* garantit une **horloge de Lamport** cohérente
+* fournit des outils de **coordination distribuée** :
+
+  * **section critique** avec un **jeton sur anneau**
+  * **barrière de synchronisation**
+  * **numérotation automatique des processus**
+  * **heartbeats + détection de pannes + renumérotation**
+
+Autrement dit : au lieu que les `Process` communiquent directement entre eux, ils passent **exclusivement** par leur `Com` local.
+
+---
+
+# ⚙️ Architecture réalisée
+
+
+---
+
+## 🚌 `Bus`
+
+**But** : simuler un **bus mémoire partagé** entre processus.
+
+* Chaque `Com` s’y **enregistre** (`join`) et reçoit un **id logique unique**.
+* Gère l’**ordre des processus vivants** dans une liste `_directory`
+* Permet à `Com` de :
+
+  * envoyer à tous (`broadcast`)
+  * envoyer à un destinataire précis (`sendto`)
+* Fait circuler les **heartbeats** pour détecter les processus morts
+* Fait la **renumérotation automatique** quand un nœud meurt
+* Fait la **barrière globale** (`barrier_arrive`)
+
+📌 Très important : ce `Bus` est une **instance**, donc il n’y a **aucune variable de classe globale** dans `Com` (comme le demande le sujet).
+
+---
+
+## 📬 `Com`
+
+C’est le **communicateur** que chaque `Process` instancie.
+Il fournit toute l’**API distribuée** exigée par le sujet :
+
+---
+
+### 🕒 Horloge de Lamport
+
+* `self.clock` est protégée par `self.clock_lock`
+* Chaque envoi (`broadcast`, `sendTo`) fait un `inc_clock()`
+* Chaque réception met à jour `clock = max(local, reçu)+1`
+
+---
+
+### 📦 Boîte aux lettres (BAL)
+
+* Chaque message reçu est déposé dans `self.mailbox`
+* Le processus peut lire avec `receive()`
+
+---
+
+### 📡 Communication asynchrone
+
+* `broadcast(payload)` : envoie à tous
+* `sendTo(payload, dest)` : envoie à un destinataire
+* gère automatiquement horloge + dépôt BAL
+
+---
+
+### ⛓ Communication synchrone
+
+* `broadcastSync(payload, from_id)` : bloque jusqu’à ce que tout le monde ait accusé réception
+* `sendToSync(payload, dest)` / `recvFromSync(from_id)` : blocage mutuel
+* implémenté avec un système de **ACKs** et d’`Event`
+
+---
+
+### 🧱 Barrière de synchronisation
+
+* `synchronize()` bloque jusqu’à ce que **tous** les processus l’appellent
+* géré par `Bus.barrier_arrive` qui libère tout le monde en même temps
+
+---
+
+### 🔐 Section critique distribuée
+
+* `requestSC()` / `releaseSC()`
+* implémenté avec un **jeton** (`Token`) qui tourne en anneau logique
+* `requestSC()` bloque tant que le processus n’a pas reçu le jeton
+* les messages de type `Token` **n’impactent pas l’horloge de Lamport** (important)
+
+---
+
+### ❤️ Heartbeats et renumérotation
+
+* chaque `Com` envoie périodiquement un heartbeat à `Bus`
+* si un `Com` ne donne plus signe de vie, `Bus.check_timeouts()` le considère mort
+* `Bus` **retire ce processus** et **recalcule les IDs** de tous les survivants
+
+---
+
+## 💌 Types de messages
+
+Dans `Message.py` (et sous-classes) :
+
+* `Message` de base (`kind`, `payload`, `lamport`, `sender`)
+* `BroadcastMessage`, `MessageTo` → messages applicatifs (USER)
+* `AckMessage` → pour la comm synchrone
+* `Token` → pour la SC
+* `BarrierMessage` → pour la barrière (optionnel)
+* `MsgKind` enum pour les distinguer
+
+📌 Les messages système (`TOKEN`, `ACK`, `RENUMBER`, `BARRIER`) **ne mettent pas à jour l’horloge**.
+
+---
+
+## 🧪 Process et Launcher
+
+* `Process` crée un `Com` et appelle ses méthodes pour faire un scénario :
+  `broadcast`, `sendTo`, `broadcastSync`, `sendToSync`, `synchronize`, `requestSC`, etc.
+* `Launcher` crée plusieurs `Process` dans des threads et les lance ensemble
+
+---
+
+# 🧩 Pourquoi ça respecte le sujet
+
+✅ Horloge de Lamport protégée
+✅ BAL pour chaque processus
+✅ Communication asynchrone et synchrone
+✅ Section critique avec jeton (messages système ignorent l’horloge)
+✅ Barrière `synchronize()`
+✅ Numérotation automatique **sans variable de classe**
+✅ Heartbeats + renumérotation dynamique
+✅ JavaDoc/README facilement ajoutables + exemple d’utilisation (`Launcher`)
+
+---
+
+
+Tu as maintenant un **middleware distribué complet** conforme au sujet, organisé proprement :
+
+```
+Bus.py
+Com.py
+Message.py / BroadcastMessage.py / MessageTo.py / Token.py / Synchronize.py
+Process.py
+Launcher.py
+```
+
+Chaque `Process` passe par son `Com`, qui passe par le `Bus`, qui distribue les messages aux autres `Com`.
+
+---
+
+Si tu veux, je peux maintenant :
+
+* 📝 t’écrire un **README clair** à rendre avec ton code
+* 🎲 ou te coder un **exemple d’application** (jeu de dés multi-processus)
+
+Veux-tu que je fasse ça ?
