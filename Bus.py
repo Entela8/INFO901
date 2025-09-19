@@ -1,4 +1,3 @@
-# Bus.py
 from __future__ import annotations
 import threading, time
 from typing import TYPE_CHECKING

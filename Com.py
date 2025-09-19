@@ -1,13 +1,22 @@
+from __future__ import annotations
 import threading, time, uuid
 from collections import deque
-from typing import Callable
-
-import Bus
 from typing import TYPE_CHECKING, Callable
+
 from Message import AckMessage, Message, MsgKind
 from BroadcastMessage import BroadcastMessage
 from MessageTo import MessageTo
 from Token import Token
+from Events import UserEvent, TokenEvent
+
+try:
+    from pyeventbus3.pyeventbus3 import PyBus
+    _HAS_PYBUS = True
+except Exception:
+    _HAS_PYBUS = False
+
+if TYPE_CHECKING:
+    from Bus import Bus
 
 HEARTBEAT_SEC = 1.0
 HEARTBEAT_TIMEOUT_SEC = 3.5
@@ -18,10 +27,7 @@ if TYPE_CHECKING:
 class Com:
     def __init__(self, bus: "Bus", on_receive: Callable[[Message], None] | None = None):
         self.bus = bus
-        self._ack_lock = threading.RLock()
-        self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
         self.node_uid = f"{uuid.uuid4()}"
-        self._ack_seq = 0
         self.id_lock = threading.RLock()
         self.id: int = -1
 
@@ -36,7 +42,7 @@ class Com:
 
         # Sync primitives
         self._ack_lock = threading.RLock()
-        self._pending_acks: dict[int, threading.Event] = {}
+        self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
         self._ack_seq = 0
 
         # Barrière
@@ -77,12 +83,24 @@ class Com:
     def broadcast(self, payload: object):
         ts = self.inc_clock()
         msg = BroadcastMessage(payload=payload, lamport=ts, sender=self.id)
+        if _HAS_PYBUS:
+            try:
+                PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
+            except Exception:
+                pass
         self.bus.broadcast(msg, exclude_uid=self.node_uid)
+
 
     def sendTo(self, payload: object, dest: int):
         ts = self.inc_clock()
         msg = MessageTo(payload=payload, lamport=ts, sender=self.id, dest=dest)
+        if _HAS_PYBUS:
+            try:
+                PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
+            except Exception:
+                pass
         self.bus.sendto(dest, msg)
+
 
     def receive(self, block: bool = True, timeout: float | None = None) -> Message | None:
         if block:
@@ -104,20 +122,30 @@ class Com:
             seq = self._new_seq()
             msg = BroadcastMessage(payload=payload, lamport=ts, sender=self.id)
             msg.ack_seq = seq
+
+            if _HAS_PYBUS:
+                try:
+                    PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
+                except Exception:
+                    pass
             remaining = self._world_size() - 1
             evt = threading.Event()
             with self._ack_lock:
                 self._pending_acks[seq] = (evt, remaining)
             self.bus.broadcast(msg, exclude_uid=self.node_uid)
             evt.wait()
-        else:
-            pass
 
     def sendToSync(self, payload: object, dest: int):
         ts = self.inc_clock()
         seq = self._new_seq()
         msg = MessageTo(payload=payload, lamport=ts, sender=self.id, dest=dest)
         msg.ack_seq = seq
+        # NEW:
+        if _HAS_PYBUS:
+            try:
+                PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
+            except Exception:
+                pass
         evt = threading.Event()
         with self._ack_lock:
             self._pending_acks[seq] = (evt, 1)
@@ -160,12 +188,13 @@ class Com:
             self.update_clock_on_recv(msg.lamport)
             ack_seq = getattr(msg, "ack_seq", None)
             if ack_seq is not None and msg.sender is not None:
+                # msg.sender est un id logique (int) → ok pour sendto
                 self.bus.sendto(msg.sender, AckMessage(seq=ack_seq, sender=self.id))
 
-            # déposer en BAL
             with self.mailbox_lock:
                 self.mailbox.append(msg)
                 self.mailbox_has_msg.set()
+
             if self.on_receive:
                 try: self.on_receive(msg)
                 except Exception: pass
@@ -184,7 +213,23 @@ class Com:
                         else:
                             self._pending_acks[seq] = (evt, remaining)
             return
-        
+
+        elif msg.kind == MsgKind.RENUMBER:
+            mapping = msg.payload
+            with self.id_lock:
+                self.id = mapping[self.node_uid]
+            return
+
+        elif msg.kind == MsgKind.TOKEN:
+            if isinstance(msg, Token) and msg.holder == self.id:
+                self._token_evt.set()
+                if _HAS_PYBUS:
+                    try:
+                        PyBus.Instance().post(TokenEvent(holder=self.id))
+                    except Exception:
+                        pass
+            return
+
     def _new_seq(self) -> int:
         with self._ack_lock:
             self._ack_seq += 1
@@ -207,6 +252,7 @@ class Com:
         while not self._stop.is_set():
             self.bus.heartbeat(self.node_uid)
             time.sleep(HEARTBEAT_SEC)
+    
     def _timeout_loop(self):
         while not self._stop.is_set():
             self.bus.check_timeouts()

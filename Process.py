@@ -1,23 +1,31 @@
-from Com import Com, Bus
-from geeteventbus.subscriber import subscriber
-from geeteventbus.eventbus import eventbus
-from geeteventbus.event import event
+from Bus import Bus
+from Com import Com
+from Events import UserEvent, TokenEvent
+
+from pyeventbus3.pyeventbus3 import PyBus, subscribe, Mode
 
 class Process:
-    def __init__(self, bus: Bus):
-        self.com = Com(bus, on_receive=self._on_receive)
+    def __init__(self, bus: Bus, name: str = ""):
+        # Com sans callback, PyBus fera le dispatch
+        self.com = Com(bus, on_receive=None)
+        self.name = name or f"P{self.com.id}"
+        PyBus.Instance().register(self, self)
 
-    @subscribe(threadMode = Mode.PARALLEL, onEvent=token)
-    def _on_receive(self, msg):
-        kind = msg.kind.name
-        sender = msg.sender
-        print(f"[P{self.com.id}] RECV {kind} from {sender} payload={getattr(msg, 'payload', None)}")
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=UserEvent)
+    def on_user_msg(self, e: UserEvent):
+        print(f"[{self.name}] @subscribe UserEvent from {e.sender} L={e.lamport} payload={e.payload}")
+
+    # receive token
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenEvent)
+    def on_token(self, e: TokenEvent):
+        if e.holder == self.com.id:
+            print(f"[{self.name}] @subscribe Token received → I can enter SC")
 
     def run_example(self):
-        print(f"[P{self.com.id}] start, world_size={len(self.com.bus._directory)}")
+        print(f"[{self.name}] start, world_size={len(self.com.bus._directory)}")
 
         # ASYNC
-        self.com.broadcast({"BONJOUR": f"from {self.com.id}"})
+        self.com.broadcast({"hello": f"from {self.com.id}"})
         self.com.sendTo(
             {"dm": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
             dest=(self.com.id + 1) % len(self.com.bus._directory)
@@ -29,26 +37,28 @@ class Process:
             from_id=self.com.id
         )
         self.com.sendToSync(
-            {"sync_one": f"to {(self.com.id + 1) % len(self.com.bus._directory)} "},
+            {"sync_one": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
             dest=(self.com.id + 1) % len(self.com.bus._directory)
         )
-        _ = self.com.recvFromSync(
-            from_id=(self.com.id - 1) % len(self.com.bus._directory), timeout=2
-        )
+        _ = self.com.recvFromSync(from_id=(self.com.id - 1) % len(self.com.bus._directory), timeout=2)
 
         # BARRIÈRE
-        print(f"[P{self.com.id}] waiting barrier")
+        print(f"[{self.name}] waiting barrier")
         self.com.synchronize()
-        print(f"[P{self.com.id}] passed barrier")
+        print(f"[{self.name}] passed barrier")
 
         # SECTION CRITIQUE
-        print(f"[P{self.com.id}] request SC")
+        print(f"[{self.name}] request SC")
         self.com.requestSC()
-        print(f"[P{self.com.id}] IN  SC")
-        print(f"[P{self.com.id}] release SC")
+        print(f"[{self.name}] IN  SC")
+        print(f"[{self.name}] release SC")
         self.com.releaseSC()
 
-        print(f"[P{self.com.id}] done")
+        print(f"[{self.name}] done")
 
     def close(self):
+        try:
+            PyBus.Instance().unregister(self, self)
+        except Exception:
+            pass
         self.com.close()
