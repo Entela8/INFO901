@@ -14,12 +14,6 @@ class Process:
     def on_user_msg(self, e: UserEvent):
         print(f"[{self.name}] @subscribe UserEvent from {e.sender} L={e.lamport} payload={e.payload}")
 
-    # receive token
-    @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenEvent)
-    def on_token(self, e: TokenEvent):
-        if e.holder == self.com.id:
-            print(f"[{self.name}] @subscribe Token received → I can enter SC")
-
     def run_example(self):
         print(f"[{self.name}] start, world_size={len(self.com.bus._directory)}")
 

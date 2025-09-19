@@ -1,3 +1,4 @@
+# Com.py
 from __future__ import annotations
 import threading, time, uuid
 from collections import deque
@@ -8,6 +9,7 @@ from BroadcastMessage import BroadcastMessage
 from MessageTo import MessageTo
 from Token import Token
 from Events import UserEvent, TokenEvent
+from pyeventbus3.pyeventbus3 import PyBus, subscribe, Mode
 
 try:
     from pyeventbus3.pyeventbus3 import PyBus
@@ -16,14 +18,12 @@ except Exception:
     _HAS_PYBUS = False
 
 if TYPE_CHECKING:
-    from Bus import Bus
+    from Bus import Bus  # typing-only to avoid circular import
 
+# === Constantes ===
+WORLD_SIZE = 3
 HEARTBEAT_SEC = 1.0
 HEARTBEAT_TIMEOUT_SEC = 3.5
-WORLD_SIZE = 3
-
-if TYPE_CHECKING:
-    from Bus import Bus
 
 class Com:
     def __init__(self, bus: "Bus", on_receive: Callable[[Message], None] | None = None):
@@ -32,43 +32,39 @@ class Com:
         self.id_lock = threading.RLock()
         self.id: int = -1
 
-        # Horloge Lamport
+        # --- Horloge Lamport ---
         self.clock_lock = threading.RLock()
         self.clock = 0
 
-        # BAL
+        # --- BAL ---
         self.mailbox = deque()
         self.mailbox_lock = threading.RLock()
         self.mailbox_has_msg = threading.Event()
 
-        # Sync primitives
+        # --- Sync (ACKs) ---
         self._ack_lock = threading.RLock()
+        # seq -> (event, remaining_acks)
         self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
         self._ack_seq = 0
 
-        # Barrière
+        # --- Barrière ---
         self._barrier_evt = threading.Event()
 
-        # SC via Token
-        self._token_evt = threading.Event()
-        self._token_next_lock = threading.RLock()
+        # --- SC state machine (demandée par le prof) ---
+        # idle -> request -> sc -> release -> idle
+        self._sc_lock = threading.RLock()
+        self.sc_state = "idle"
+        self._in_sc_evt = threading.Event()  # réveille requestSC() quand on passe en "sc"
 
-        # Callbacks
+        # --- Callbacks app (optionnel) ---
         self.on_receive = on_receive
 
-        # Threads
-        self._stop = threading.Event()
-        self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
-        self._timeout_thread = threading.Thread(target=self._timeout_loop, daemon=True)
-        self._token_thread = threading.Thread(target=self._token_loop, daemon=True)
-
-        # Join & start
+        # --- Join ---
         self.id = self.bus.join(self)
+
+        # Jeton initial au P0
         if self.id == 0:
             self._deliver(Token(holder=0))
-        self._hb_thread.start()
-        self._timeout_thread.start()
-        self._token_thread.start()
 
     # === Horloge ===
     def inc_clock(self, delta: int = 1):
@@ -127,6 +123,7 @@ class Com:
                     PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
                 except Exception:
                     pass
+
             remaining = WORLD_SIZE - 1
             evt = threading.Event()
             with self._ack_lock:
@@ -145,6 +142,7 @@ class Com:
                 PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
             except Exception:
                 pass
+
         evt = threading.Event()
         with self._ack_lock:
             self._pending_acks[seq] = (evt, 1)
@@ -166,35 +164,43 @@ class Com:
         self._barrier_evt.wait()
         self._barrier_evt.clear()
 
-    # === Section critique distribuée (token) ===
+    # === Section critique distribuée (style prof) ===
     def requestSC(self):
-        self._token_evt.wait()
+        # Je demande la SC et j'attends d'y entrer
+        with self._sc_lock:
+            self.sc_state = "request"
+        self._in_sc_evt.wait()
 
     def releaseSC(self):
-        with self._token_next_lock:
-            next_id = (self.id + 1) % WORLD_SIZE
-        self._token_evt.clear()
-        self.bus.sendto(next_id, Token(holder=next_id))
+        with self._sc_lock:
+            self.sc_state = "release"
+        self._in_sc_evt.clear()
 
     # === Arrêt ===
     def close(self):
-        self._stop.set()
         self.bus.leave(self)
 
+    # === Délivrance de tout message entrant ===
     def _deliver(self, msg: Message):
         if msg.kind == MsgKind.USER:
+            # Horloge Lamport
             self.update_clock_on_recv(msg.lamport)
+            # ACK si message sync
             ack_seq = getattr(msg, "ack_seq", None)
             if ack_seq is not None and msg.sender is not None:
                 self.bus.sendto(msg.sender, AckMessage(seq=ack_seq, sender=self.id))
 
+            # Dépôt BAL
             with self.mailbox_lock:
                 self.mailbox.append(msg)
                 self.mailbox_has_msg.set()
 
+            # Callback éventuel
             if self.on_receive:
-                try: self.on_receive(msg)
-                except Exception: pass
+                try:
+                    self.on_receive(msg)
+                except Exception:
+                    pass
             return
 
         elif msg.kind == MsgKind.ACK:
@@ -219,40 +225,58 @@ class Com:
 
         elif msg.kind == MsgKind.TOKEN:
             if isinstance(msg, Token) and msg.holder == self.id:
-                self._token_evt.set()
                 if _HAS_PYBUS:
                     try:
                         PyBus.Instance().post(TokenEvent(holder=self.id))
                     except Exception:
                         pass
+
+                with self._sc_lock:
+                    want = (self.sc_state == "request")
+
+                if not want:
+                    # Pas besoin: forward immédiat (ASYNCHRONE pour éviter la récursion)
+                    self._forward_token_async((self.id + 1) % WORLD_SIZE)
+                    return
+
+                # J'entre en SC
+                with self._sc_lock:
+                    self.sc_state = "sc"
+                self._in_sc_evt.set()  # réveille requestSC()
+
+                # Attendre que releaseSC() bascule l'état sur "release"
+                while True:
+                    time.sleep(0.05)
+                    with self._sc_lock:
+                        if self.sc_state == "release":
+                            self.sc_state = "idle"
+                            break
+
+                # Forward au suivant (ASYNCHRONE)
+                self._in_sc_evt.clear()
+                self._forward_token_async((self.id + 1) % WORLD_SIZE)
             return
 
+    # === Helpers ===
     def _new_seq(self) -> int:
         with self._ack_lock:
             self._ack_seq += 1
             return self._ack_seq
 
-    #mets à jour l'identifiant logique
     def _onRenumber(self, mapping: dict[str, int]):
+        # Utilisé seulement si vous conservez la renumérotation via Bus
         m = Message(kind=MsgKind.RENUMBER, payload=mapping, lamport=0, sender=None)
         self._deliver(m)
 
     def _onBarrierRelease(self):
         self._barrier_evt.set()
-        
-    # threads
-    # heartbeats
-    def _hb_loop(self):
-        while not self._stop.is_set():
-            self.bus.heartbeat(self.node_uid)
-            time.sleep(HEARTBEAT_SEC)
-    
-    def _timeout_loop(self):
-        while not self._stop.is_set():
-            self.bus.check_timeouts()
-            time.sleep(HEARTBEAT_SEC)
 
-    def _token_loop(self):
-        # rien à faire: le token circule via messages
-        while not self._stop.is_set():
-            time.sleep(0.1)
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenEvent)
+    def on_token(self, e: TokenEvent):
+        if e.holder == self.com.id:
+            print(f"[{self.name}] @subscribe Token received → I can enter SC")
+
+    def _forward_token_async(self, next_id: int):
+        def _send():
+            self.bus.sendto(next_id, Token(holder=next_id))
+        threading.Thread(target=_send, daemon=True).start()
