@@ -3,6 +3,10 @@ from Message import Message, MsgKind
 
 @dataclass
 class Token(Message):
+    """
+    Message système représentant le jeton de section critique.
+    Le champ `holder` indique le 'propriétaire' prévu (id logique).
+    """
     holder: int
 
     def __init__(self, holder: int):

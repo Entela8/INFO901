@@ -3,6 +3,11 @@ from Process import Process
 import threading
 
 def main():
+    """ Démarre une petite démo :
+    - crée un Bus
+    - instancie N Process (ici 3)
+    - lance leur scénario `run_example()`
+    - attend la fin puis ferme proprement"""
     bus = Bus()
     procs = [Process(bus, name=f"P{i}") for i in range(3)]
     threads = [threading.Thread(target=p.run_example) for p in procs]
