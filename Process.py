@@ -6,7 +6,6 @@ from pyeventbus3.pyeventbus3 import PyBus, subscribe, Mode
 
 class Process:
     def __init__(self, bus: Bus, name: str = ""):
-        # Com sans callback, PyBus fera le dispatch
         self.com = Com(bus, on_receive=None)
         self.name = name or f"P{self.com.id}"
         PyBus.Instance().register(self, self)
@@ -25,7 +24,7 @@ class Process:
         print(f"[{self.name}] start, world_size={len(self.com.bus._directory)}")
 
         # ASYNC
-        self.com.broadcast({"hello": f"from {self.com.id}"})
+        self.com.broadcast({"BONJOUR": f"from {self.com.id}"})
         self.com.sendTo(
             {"dm": f"to {(self.com.id + 1) % len(self.com.bus._directory)}"},
             dest=(self.com.id + 1) % len(self.com.bus._directory)

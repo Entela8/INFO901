@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 HEARTBEAT_SEC = 1.0
 HEARTBEAT_TIMEOUT_SEC = 3.5
+WORLD_SIZE = 3
 
 if TYPE_CHECKING:
     from Bus import Bus
@@ -90,7 +91,6 @@ class Com:
                 pass
         self.bus.broadcast(msg, exclude_uid=self.node_uid)
 
-
     def sendTo(self, payload: object, dest: int):
         ts = self.inc_clock()
         msg = MessageTo(payload=payload, lamport=ts, sender=self.id, dest=dest)
@@ -100,7 +100,6 @@ class Com:
             except Exception:
                 pass
         self.bus.sendto(dest, msg)
-
 
     def receive(self, block: bool = True, timeout: float | None = None) -> Message | None:
         if block:
@@ -128,7 +127,7 @@ class Com:
                     PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
                 except Exception:
                     pass
-            remaining = self._world_size() - 1
+            remaining = WORLD_SIZE - 1
             evt = threading.Event()
             with self._ack_lock:
                 self._pending_acks[seq] = (evt, remaining)
@@ -140,7 +139,7 @@ class Com:
         seq = self._new_seq()
         msg = MessageTo(payload=payload, lamport=ts, sender=self.id, dest=dest)
         msg.ack_seq = seq
-        # NEW:
+
         if _HAS_PYBUS:
             try:
                 PyBus.Instance().post(UserEvent(sender=self.id, lamport=ts, payload=payload))
@@ -171,10 +170,9 @@ class Com:
     def requestSC(self):
         self._token_evt.wait()
 
-    #in release juste liberer la SC, et pas renvoiyer le token, function token propre pour mettre à jour le token
     def releaseSC(self):
         with self._token_next_lock:
-            next_id = (self.id + 1) % self._world_size() #const
+            next_id = (self.id + 1) % WORLD_SIZE
         self._token_evt.clear()
         self.bus.sendto(next_id, Token(holder=next_id))
 
@@ -188,7 +186,6 @@ class Com:
             self.update_clock_on_recv(msg.lamport)
             ack_seq = getattr(msg, "ack_seq", None)
             if ack_seq is not None and msg.sender is not None:
-                # msg.sender est un id logique (int) → ok pour sendto
                 self.bus.sendto(msg.sender, AckMessage(seq=ack_seq, sender=self.id))
 
             with self.mailbox_lock:
@@ -242,10 +239,7 @@ class Com:
 
     def _onBarrierRelease(self):
         self._barrier_evt.set()
-
-    def _world_size(self) -> int:
-        return len(self.bus._directory)
-
+        
     # threads
     # heartbeats
     def _hb_loop(self):
